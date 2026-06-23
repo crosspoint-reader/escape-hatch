@@ -1,0 +1,9 @@
+.pio/
+.cache/
+.vscode/
+*.bin.bak
+
+# Machine-specific SDK path override (symlinks to a local freeink-sdk working
+# copy). The committed platformio.ini builds from the freeink-sdk submodule;
+# this file is per-developer and must not be committed.
+platformio.local.ini
