@@ -12,10 +12,17 @@ flash this once and you can always reflash from the SD card with three buttons.
 1. **Auto-detects X3 vs X4** at boot via an I²C fingerprint of the X3-only
    peripherals (BQ27220 gauge / DS3231 RTC / QMI8658 IMU on SDA20/SCL0) and
    selects the matching panel driver — one binary drives both.
-2. **Mounts the SD card** and shows a **file browser** of folders and `.bin`
-   files (built from FreeInkUI's `list`).
-3. **Flashes** the selected image straight into the inactive OTA partition with
-   interleaved erase/write, then switches `otadata` and reboots into it.
+2. Boots to a small **menu** — **Flash Firmware** and **Button Test**.
+3. **Flash Firmware** mounts the SD card and shows a **file browser** of folders
+   and `.bin` files (built from FreeInkUI's `list`), then **flashes** the selected
+   image straight into the inactive OTA partition with interleaved erase/write,
+   switches `otadata`, and reboots into it.
+4. **Button Test** is a hardware diagnostic: press any button to see its name and
+   the live ADC value of the resistor-ladder GPIO it drives. Double-tap **Back**
+   to return to the menu.
+
+The button hints along the bottom of every screen are drawn as icons (the
+Lucide-derived set shared with the inkdeck firmware) rather than text labels.
 
 The flash path is the exact SD-flash process from
 [`crosspoint-reader`](../crosspoint-reader-main) — `FirmwareFlasher` (full ESP32
@@ -31,10 +38,12 @@ CrossPoint's `HalStorage` to the FreeInk `SDCardManager` (`FsFile`).
 | -------- | -------------------------------------------------- |
 | **Up**   | Move selection up                                  |
 | **Down** | Move selection down                                |
-| **OK**   | Enter a folder, or pick a `.bin` → flash-confirm   |
-| **Back** | Go up a folder / cancel the flash confirm          |
+| **OK**   | Select a menu item / enter a folder / pick a `.bin`|
+| **Back** | Go up a folder; at the root, return to the menu    |
 
 On the confirm screen, **OK** flashes and reboots; **Back** returns to the list.
+In **Button Test**, every press shows that button's name and ADC reading;
+double-tap **Back** to exit to the menu.
 
 ## Building
 

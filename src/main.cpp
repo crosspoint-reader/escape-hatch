@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "ButtonHintIcons.h"
 #include "FirmwareFlasher.h"
 
 namespace ui = freeink::ui;
@@ -53,8 +54,18 @@ void pushDisplay() {
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
-enum class State { Browsing, Confirm, Failed };
-State g_state = State::Browsing;
+enum class State { Menu, Browsing, Confirm, ButtonTest, Failed };
+State g_state = State::Menu;
+
+// Top-level menu entries (home screen).
+const char* kMenuItems[] = {"Flash Firmware", "Button Test"};
+constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
+int g_menuSel = 0;
+
+// Button-test screen: timestamp of the last Back press, to detect a double-tap
+// (the test shows every button's reading, so a single Back is a reading too —
+// only a quick second tap exits back to the menu).
+unsigned long g_lastBackPress = 0;
 
 std::string g_path = "/";          // current directory
 std::vector<std::string> g_names;  // entry display names (folders end in '/')
@@ -130,6 +141,99 @@ void loadEntries() {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+// Draw the four hardware button hints as icons (replacing the old text labels).
+// Reserves the footer band from the screen layout first — same as screen.footer()
+// — so the body above never overlaps it, then centres an icon in each of the four
+// slots, in hardware order: [Back][Confirm] (left bezel) [Up][Down] (right bezel).
+// A blank slot (btnhint::none()) draws nothing.
+template <size_t N>
+void iconFooter(ui::Screen<N>& screen, ui::BitmapRef i0, ui::BitmapRef i1, ui::BitmapRef i2, ui::BitmapRef i3) {
+  const ui::Rect rect = screen.takeBottom(g_theme.footerHeight);
+  if (rect.empty()) return;
+  ui::DrawTarget& t = screen.target();
+
+  // Divider line along the top edge of the footer band.
+  t.fill(ui::Rect{rect.x, rect.y, rect.width, 1}, ui::Paint::solid(ui::Color::Black));
+
+  const int16_t sidePadding = 8;
+  const int16_t gap = 4;
+  const int16_t contentW = static_cast<int16_t>(rect.width - sidePadding * 2);
+  const int16_t slotW = static_cast<int16_t>((contentW - gap * 3) / 4);
+  const ui::BitmapRef icons[4] = {i0, i1, i2, i3};
+
+  int16_t x = static_cast<int16_t>(rect.x + sidePadding);
+  for (int i = 0; i < 4; ++i) {
+    const int16_t w = i == 3 ? static_cast<int16_t>(rect.right() - sidePadding - x) : slotW;
+    if (icons[i]) {
+      t.bitmap(ui::Rect{x, rect.y, w, rect.height}, icons[i], ui::BitmapMode::Center,
+               ui::Paint::solid(ui::Color::Black));
+    }
+    x = static_cast<int16_t>(x + w + gap);
+  }
+}
+
+void renderMenu() {
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<8> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<8> frame(*g_target, dev, empty, ib);
+  ui::Screen<8> screen(frame, g_theme);
+
+  screen.header("Escape Hatch");
+  // No Back at the menu root; Confirm selects, Up/Down move.
+  iconFooter(screen, btnhint::none(), btnhint::confirm(), btnhint::up(), btnhint::down());
+
+  ui::ListItem items[kMenuCount];
+  for (int i = 0; i < kMenuCount; ++i) {
+    items[i] = ui::ListItem{};
+    items[i].label = kMenuItems[i];
+    items[i].actionValue = static_cast<int16_t>(i);
+  }
+  ui::ListProps props{};
+  props.items = items;
+  props.count = static_cast<uint16_t>(kMenuCount);
+  props.selectedIndex = g_menuSel;
+  props.topIndex = 0;
+  props.rowHeight = kRowHeight;
+  props.selectionMarker = ui::SelectionMarker::Triangle;
+  screen.list(props);
+
+  frame.finish();
+  pushDisplay();
+}
+
+void renderButtonTest(const char* btnName, int adc) {
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("Button Test");
+  // Only Back is meaningful here (double-tap to exit); the other slots stay blank
+  // because every button press is consumed as a reading, not navigation.
+  iconFooter(screen, btnhint::back(), btnhint::none(), btnhint::none(), btnhint::none());
+
+  std::string body;
+  if (btnName) {
+    body = std::string(btnName) + "\n\nADC: " + std::to_string(adc);
+  } else {
+    body = "Press any button to\nshow its name and ADC.";
+  }
+  body += "\n\n(double-tap Back to exit)";
+
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Center;
+  ts.maxLines = 8;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
 void renderList() {
   display.clearScreen(0xFF);
   ui::DeviceContext dev = g_target->deviceContext();
@@ -141,15 +245,9 @@ void renderList() {
   std::string title = "Escape Hatch   " + g_path;
   screen.header(title.c_str());
 
-  // Hints in hardware order: left-side buttons (Back, Confirm) on the left,
+  // Icon hints in hardware order: left-side buttons (Back, Confirm) on the left,
   // right-side buttons (Up, Down) on the right.
-  const ui::FooterAction footer[] = {
-      {.label = "Back", .action = ui::NO_ACTION},
-      {.label = "Confirm", .action = ui::NO_ACTION},
-      {.label = "Up", .action = ui::NO_ACTION},
-      {.label = "Down", .action = ui::NO_ACTION},
-  };
-  screen.footer(footer, 4);
+  iconFooter(screen, btnhint::back(), btnhint::confirm(), btnhint::up(), btnhint::down());
 
   if (g_items.empty()) {
     screen.popup("No .bin files in this folder");
@@ -202,13 +300,7 @@ void renderConfirm() {
   // Four slots matching the browser footer ([Back][Confirm][Up][Down]) so the
   // Cancel/Confirm hints sit under the SAME physical buttons (left side) instead
   // of spreading across the bar — the right two slots (Up/Down) are unused here.
-  const ui::FooterAction footer[] = {
-      {.label = "Cancel", .action = ui::NO_ACTION},
-      {.label = "Confirm", .action = ui::NO_ACTION},
-      {.label = "", .action = ui::NO_ACTION},
-      {.label = "", .action = ui::NO_ACTION},
-  };
-  screen.footer(footer, 4);
+  iconFooter(screen, btnhint::cancel(), btnhint::confirm(), btnhint::none(), btnhint::none());
 
   std::string body = "Flash this image and reboot into it?\n\n" + g_names[g_sel];
   ui::TextStyle ts{};
@@ -308,7 +400,12 @@ void doBrowse(int navDelta, bool confirm, bool back) {
   // A transition (back/confirm) renders the new screen itself, so skip the
   // intermediate list redraw in that case.
   if (back) {
-    goUpDirectory();
+    if (g_path == "/") {
+      g_state = State::Menu;
+      renderMenu();
+    } else {
+      goUpDirectory();
+    }
     return;
   }
   if (confirm && !g_items.empty()) {
@@ -322,6 +419,35 @@ void doBrowse(int navDelta, bool confirm, bool back) {
     return;
   }
   if (navDelta != 0) renderList();
+}
+
+void doMenu(int navDelta, bool confirm) {
+  if (navDelta != 0) {
+    int s = (g_menuSel + navDelta) % kMenuCount;
+    if (s < 0) s += kMenuCount;
+    g_menuSel = s;
+  }
+  if (confirm) {
+    if (g_menuSel == 0) {  // Flash Firmware
+      g_state = State::Browsing;
+      g_path = "/";
+      loadEntries();
+      renderList();
+    } else {  // Button Test
+      g_state = State::ButtonTest;
+      g_lastBackPress = 0;
+      renderButtonTest(nullptr, 0);
+    }
+    return;
+  }
+  if (navDelta != 0) renderMenu();
+}
+
+// The ADC ladder splits across two GPIOs: Back/Confirm/Left/Right on pin 1,
+// Up/Down on pin 2. Read whichever the pressed button lives on so the reported
+// value is the one its resistor divider actually produced.
+int adcPinForButton(uint8_t button) {
+  return button < InputManager::BTN_UP ? InputManager::BUTTON_ADC_PIN_1 : InputManager::BUTTON_ADC_PIN_2;
 }
 
 void doConfirmScreen(bool confirm, bool back) {
@@ -342,12 +468,17 @@ unsigned long g_actionIgnoreUntil = 0;
 
 void dispatchAction(int navDelta, bool confirm, bool back) {
   switch (g_state) {
+    case State::Menu:
+      doMenu(navDelta, confirm);
+      break;
     case State::Browsing:
       doBrowse(navDelta, confirm, back);
       break;
     case State::Confirm:
       doConfirmScreen(confirm, back);
       break;
+    case State::ButtonTest:
+      break;  // handled directly in loop()
     case State::Failed:
       g_state = State::Browsing;
       renderList();
@@ -402,9 +533,8 @@ void setup() {
     return;
   }
 
-  loadEntries();
-  g_state = State::Browsing;
-  renderList();  // boot paint: FULL, seeds the differential base
+  g_state = State::Menu;
+  renderMenu();  // boot paint: FULL, seeds the differential base
 
   // X3: prime the fast-refresh pipeline with one fast refresh of the same frame,
   // so the first interactive press is a clean fast refresh rather than the
@@ -413,6 +543,36 @@ void setup() {
 }
 
 void loop() {
+  // Button test: every press is a reading, not navigation. Show the button's
+  // name and the live ADC value of the GPIO its divider drives; a quick second
+  // Back press (within the double-tap window) returns to the menu.
+  if (g_state == State::ButtonTest) {
+    uint8_t b;
+    while (input.popPress(b)) {
+      if (millis() < g_actionIgnoreUntil) continue;  // discard release-ramp artifacts
+      const unsigned long now = millis();
+      if (b == InputManager::BTN_BACK) {
+        if (g_lastBackPress != 0 && now - g_lastBackPress < 700) {
+          g_state = State::Menu;
+          g_lastBackPress = 0;
+          renderMenu();
+          g_actionIgnoreUntil = now + 250;
+          break;
+        }
+        g_lastBackPress = now;
+      } else {
+        g_lastBackPress = 0;  // any other button breaks a pending double-tap
+      }
+      const int adc = analogRead(adcPinForButton(b));
+      renderButtonTest(InputManager::getButtonName(b), adc);
+      // Confirm's release ramps up through the Back ADC range; swallow the
+      // phantom Back press it would otherwise produce.
+      if (b == InputManager::BTN_CONFIRM) g_actionIgnoreUntil = now + 250;
+    }
+    delay(10);
+    return;
+  }
+
   // Drain the latched button events. Navigation coalesces into one delta; a
   // discrete Confirm/Back is dispatched immediately (applying any pending nav
   // first) and ends the drain, so the rest of the queue is re-evaluated next
