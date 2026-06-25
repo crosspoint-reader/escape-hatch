@@ -20,6 +20,15 @@ flash this once and you can always reflash from the SD card with three buttons.
 4. **Button Test** is a hardware diagnostic: press any button to see its name and
    the live ADC value of the resistor-ladder GPIO it drives. Double-tap **Back**
    to return to the menu.
+5. **Boot Other Slot** points the bootloader at the *other* OTA app partition and
+   reboots into it (e.g. back into your main firmware) — without reflashing. It
+   first checks that slot actually starts with a valid app image (`0xE9` magic)
+   and refuses if it's empty, so it can't strand you on a blank partition.
+6. **EFuse / Security** reads (never burns) the chip's security efuses — Secure
+   Boot, flash encryption, serial-download / JTAG disables, chip revision — and
+   gives a one-line verdict on whether a custom-bootloader recovery is possible
+   and recoverable on this device. See
+   [`docs/recovery-bootloader-feasibility.md`](docs/recovery-bootloader-feasibility.md).
 
 The button hints along the bottom of every screen are drawn as icons (the
 Lucide-derived set shared with the inkdeck firmware) rather than text labels.
@@ -99,4 +108,34 @@ the SDK previously left to each consumer. Any dual X3/X4 app can reuse it.
 `partitions.csv` matches the device's stock 16 MB dual-OTA layout (`otadata` +
 `ota_0` + `ota_1`) so the factory bootloader and `otadata` pick up whatever this
 tool writes, and so Escape Hatch can live in one OTA slot while it flashes a full
-firmware into the other.
+firmware into the other. Escape Hatch is uploaded to **`ota_0`** (`offset_address
+= 0x10000`); a flashed firmware lands in **`ota_1`**.
+
+## Recovery combo (boot back into Escape Hatch)
+
+The SDK lib **`RecoveryBoot`** provides `freeink::recovery::checkBootCombo()`:
+held at reset, the combo **Back + Up** repoints `otadata` at `ota_0` and reboots
+into Escape Hatch. It's called as the first line of `setup()` here.
+
+The stock second-stage bootloader can't read buttons — only the firmware that
+boots can — so this check has to run inside *each* firmware, as the first line of
+`setup()`. Calling it in Escape Hatch itself is a no-op (it's already `ota_0`);
+the payoff is calling the **same function from your main firmware(s)** (it lives
+in the shared SDK so any firmware can `#include <RecoveryBoot.h>`), so a held
+combo there bounces you back here. It's safe to call unconditionally: it does
+nothing unless the combo is held, `ota_0` holds a valid app, and you're not
+already running from `ota_0`.
+
+Why **Back + Up** specifically: the buttons are an ADC resistor ladder with
+Back/Confirm/Left/Right on GPIO1 and Up/Down on GPIO2. Two buttons on the *same*
+pin (e.g. Back+Right) collapse to one reading and can't be told apart, so a
+detectable combo must take one button from each pin.
+
+Two limits worth knowing:
+
+- A firmware that crashes in ROM / early SDK init *before* reaching the check
+  can't be escaped this way. A corrupt app *image*, though, is caught for free:
+  the bootloader falls back to the other OTA slot on its own.
+- Truly unconditional GPIO recovery (independent of the running app) would need a
+  custom second-stage bootloader — which Escape Hatch deliberately never
+  reflashes, since a bad bootloader is the one thing it couldn't recover from.

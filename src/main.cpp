@@ -19,12 +19,21 @@
 #include <SPI.h>
 #include <XteinkDetect.h>
 
+#include <esp_chip_info.h>
+#include <esp_efuse.h>
+#include <esp_efuse_table.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+
 #include <algorithm>
 #include <string>
 #include <vector>
 
+#include <RecoveryBoot.h>
+
 #include "ButtonHintIcons.h"
 #include "FirmwareFlasher.h"
+#include "OtaBootSwitch.h"
 
 namespace ui = freeink::ui;
 
@@ -55,13 +64,18 @@ void pushDisplay() {
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
-enum class State { Menu, Browsing, Confirm, ButtonTest, Failed };
+enum class State { Menu, Browsing, Confirm, BootConfirm, ButtonTest, EfuseInfo, Failed };
 State g_state = State::Menu;
 
 // Top-level menu entries (home screen).
-const char* kMenuItems[] = {"Flash Firmware", "Button Test"};
+const char* kMenuItems[] = {"Flash Firmware", "Button Test", "Boot Other Slot", "EFuse / Security"};
 constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
 int g_menuSel = 0;
+
+// The inactive OTA app partition we're about to switch the bootloader to,
+// captured when the user picks "Boot Other Slot" (only set once validated to
+// hold a real app image).
+const esp_partition_t* g_bootDest = nullptr;
 
 // Button-test screen: timestamp of the last Back press, to detect a double-tap
 // (the test shows every button's reading, so a single Back is a reading too —
@@ -85,6 +99,24 @@ int g_top = 0;
 std::string g_flashPath;  // full path of the .bin awaiting/within a flash
 std::string g_error;
 int g_lastPct = -1;
+
+// ---------------------------------------------------------------------------
+// OTA partitions
+// ---------------------------------------------------------------------------
+// The OTA app slot that ISN'T the one we're running from — the "other" firmware.
+const esp_partition_t* inactiveAppPartition() { return esp_ota_get_next_update_partition(nullptr); }
+
+// True if `p` begins with a plausible ESP32 app image. We only check the image
+// magic (0xE9) — deliberately NOT esp_image_verify(), which on these devices
+// rejects the patched X4 image with bogus efuse errors (the very reason the
+// flasher bypasses it). 0xE9 also excludes an erased (0xFF) or empty slot, which
+// is all we need to avoid pointing the bootloader at a partition with no app.
+bool partitionHasApp(const esp_partition_t* p) {
+  if (!p) return false;
+  uint8_t magic = 0;
+  if (esp_partition_read(p, 0, &magic, sizeof(magic)) != ESP_OK) return false;
+  return magic == 0xE9;  // ESP_IMAGE_HEADER_MAGIC
+}
 
 // ---------------------------------------------------------------------------
 // SD enumeration
@@ -359,6 +391,85 @@ void renderConfirm() {
   pushDisplay();
 }
 
+void renderBootConfirm() {
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("Boot other slot?");
+  iconFooter(screen, btnhint::cancel(), btnhint::confirm(), btnhint::none(), btnhint::none());
+
+  std::string body = "Switch the bootloader to '";
+  body += g_bootDest ? g_bootDest->label : "?";
+  body += "' and reboot into it?\n\nReturning needs that firmware (or a reflash).";
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Center;
+  ts.maxLines = 8;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
+// Read-only dump of the chip's security efuses — the facts that decide whether a
+// custom-bootloader recovery (rewriting flash 0x0) is even possible, and whether
+// a bad bootloader write could be undone. All reads; nothing is burned.
+void renderEfuseInfo() {
+  const bool secureBoot = esp_efuse_read_field_bit(ESP_EFUSE_SECURE_BOOT_EN);
+  uint8_t cryptCnt = 0;  // SPI_BOOT_CRYPT_CNT: flash encryption on when popcount is odd
+  esp_efuse_read_field_blob(ESP_EFUSE_SPI_BOOT_CRYPT_CNT, &cryptCnt, 3);
+  const bool flashEnc = (__builtin_popcount(cryptCnt) & 1) != 0;
+  // These bits mean "interface disabled" when set, so a clear bit = still usable.
+  const bool dlDisabled = esp_efuse_read_field_bit(ESP_EFUSE_DIS_DOWNLOAD_MODE);
+  const bool usbJtagDisabled = esp_efuse_read_field_bit(ESP_EFUSE_DIS_USB_JTAG);
+  const bool padJtagDisabled = esp_efuse_read_field_bit(ESP_EFUSE_DIS_PAD_JTAG);
+
+  esp_chip_info_t chip{};
+  esp_chip_info(&chip);
+
+  auto yn = [](bool on) { return on ? "ON" : "off"; };
+  auto en = [](bool disabled) { return disabled ? "disabled" : "enabled"; };
+
+  std::string body;
+  body += "Secure Boot: " + std::string(yn(secureBoot)) + "\n";
+  body += "Flash Encryption: " + std::string(yn(flashEnc)) + "\n";
+  body += "Serial download: " + std::string(en(dlDisabled)) + "\n";
+  body += "USB-JTAG: " + std::string(en(usbJtagDisabled)) + "\n";
+  body += "Pad JTAG: " + std::string(en(padJtagDisabled)) + "\n";
+  body += "Chip rev: v" + std::to_string(chip.revision / 100) + "." + std::to_string(chip.revision % 100) + "\n\n";
+
+  // One-line verdict for the bootloader-recovery question.
+  if (secureBoot || flashEnc) {
+    body += "Bootloader rewrite: BLOCKED (would brick).";
+  } else if (dlDisabled) {
+    body += "Bootloader writable, but NO serial recovery: a bad write is unrecoverable.";
+  } else {
+    body += "Bootloader writable; serial download still available as a recovery path.";
+  }
+
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("EFuse / Security");
+  iconFooter(screen, btnhint::back(), btnhint::none(), btnhint::none(), btnhint::none());
+
+  screen.insetContent(ui::Insets{8, 16, 8, 16});
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Left;
+  ts.maxLines = 12;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
 void renderProgress(const char* title, int pct) {
   display.clearScreen(0xFF);
   ui::DisplayTarget& t = *g_target;
@@ -480,10 +591,24 @@ void doMenu(int navDelta, bool confirm) {
       g_path = "/";
       loadEntries();
       renderList();
-    } else {  // Button Test
+    } else if (g_menuSel == 1) {  // Button Test
       g_state = State::ButtonTest;
       g_lastBackPress = 0;
       renderButtonTest(nullptr, 0);
+    } else if (g_menuSel == 2) {  // Boot Other Slot
+      g_bootDest = inactiveAppPartition();
+      if (!partitionHasApp(g_bootDest)) {
+        g_bootDest = nullptr;
+        g_state = State::Failed;
+        renderMessage("No firmware there", "The other partition has no bootable app to switch to.",
+                      "Any key: back");
+      } else {
+        g_state = State::BootConfirm;
+        renderBootConfirm();
+      }
+    } else {  // EFuse / Security
+      g_state = State::EfuseInfo;
+      renderEfuseInfo();
     }
     return;
   }
@@ -506,6 +631,22 @@ void doConfirmScreen(bool confirm, bool back) {
   }
 }
 
+void doBootConfirm(bool confirm, bool back) {
+  if (confirm && g_bootDest) {
+    renderMessage("Switching...", "Rebooting into the other partition.", nullptr);
+    if (ota_boot::switchTo(g_bootDest)) {
+      delay(800);
+      ESP.restart();
+      return;  // not reached
+    }
+    g_state = State::Failed;
+    renderMessage("Switch failed", "Could not update the boot selection.", "Any key: back");
+  } else if (back) {
+    g_state = State::Menu;
+    renderMenu();
+  }
+}
+
 // Window during which input is ignored, set right after a screen-changing
 // action. The buttons are an ADC resistor ladder where Confirm (2090-3100) and
 // Back (3100-3900) are adjacent: releasing Confirm ramps its voltage up through
@@ -524,11 +665,20 @@ void dispatchAction(int navDelta, bool confirm, bool back) {
     case State::Confirm:
       doConfirmScreen(confirm, back);
       break;
+    case State::BootConfirm:
+      doBootConfirm(confirm, back);
+      break;
     case State::ButtonTest:
       break;  // handled directly in loop()
+    case State::EfuseInfo:
+      if (back || confirm) {
+        g_state = State::Menu;
+        renderMenu();
+      }
+      break;
     case State::Failed:
-      g_state = State::Browsing;
-      renderList();
+      g_state = State::Menu;
+      renderMenu();
       break;
   }
   if (confirm || back) g_actionIgnoreUntil = millis() + 250;  // swallow the release ramp
@@ -540,6 +690,11 @@ void dispatchAction(int navDelta, bool confirm, bool back) {
 void setup() {
   Serial.begin(115200);
   delay(50);
+
+  // Recovery hatch: if Back+Up is held at reset, jump back to the Escape Hatch
+  // slot before doing anything else. A no-op here (we ARE that slot) — it earns
+  // its keep when the SAME call is the first line of the other firmwares' setup.
+  freeink::recovery::checkBootCombo();
 
   // Pick X3 vs X4 before any peripheral reads the active board profile.
   const bool isX3 = freeink::selectXteinkDevice();
