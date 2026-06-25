@@ -14,6 +14,7 @@
 #include <FreeInkUI.h>
 #include <FreeInkUIDisplayTarget.h>
 #include <InputManager.h>
+#include <PowerManager.h>
 #include <SDCardManager.h>
 #include <SPI.h>
 #include <XteinkDetect.h>
@@ -66,6 +67,13 @@ int g_menuSel = 0;
 // (the test shows every button's reading, so a single Back is a reading too —
 // only a quick second tap exits back to the menu).
 unsigned long g_lastBackPress = 0;
+
+// Power button: hold it for kPowerSleepHoldMs to deep-sleep. Armed only while the
+// button is released, so the wake press that boots us can't immediately re-trigger
+// sleep, and g_allowSleepAt blanks the threshold for a moment after boot.
+constexpr uint32_t kPowerSleepHoldMs = 1500;
+uint32_t g_allowSleepAt = 0;
+bool g_powerSleepArmed = true;
 
 std::string g_path = "/";          // current directory
 std::vector<std::string> g_names;  // entry display names (folders end in '/')
@@ -171,6 +179,45 @@ void iconFooter(ui::Screen<N>& screen, ui::BitmapRef i0, ui::BitmapRef i1, ui::B
     }
     x = static_cast<int16_t>(x + w + gap);
   }
+}
+
+// A full-screen, chrome-less splash: a centered title with a subtitle beneath.
+// Used for the boot and sleep screens (no header/footer, like inkdeck's).
+void renderSplash(const char* subtitle, EInkDisplay::RefreshMode mode) {
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<2> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<2> frame(*g_target, dev, empty, ib);
+  ui::Screen<2> screen(frame, g_theme);
+
+  screen.setContentMargin(ui::Insets{24, 24, 24, 24});
+  const ui::Rect body = screen.body();
+
+  ui::TextStyle title = g_theme.titleText;
+  title.align = ui::TextAlign::Center;
+  title.maxLines = 1;
+  ui::TextStyle sub = g_theme.bodyText;
+  sub.align = ui::TextAlign::Center;
+  sub.maxLines = 2;
+
+  const ui::Rect titleRect{body.x, static_cast<int16_t>(body.y + body.height / 2 - 48), body.width, 32};
+  const ui::Rect subRect{body.x, static_cast<int16_t>(titleRect.bottom() + 10), body.width, 56};
+  frame.target().text(titleRect, "Escape Hatch", title);
+  frame.target().text(subRect, subtitle, sub);
+
+  frame.finish();
+  display.displayBuffer(mode);
+}
+
+// Render the sleep splash, park the panel, and deep-sleep until the power button
+// is pressed again (which resets the chip → a fresh boot). Does not return.
+[[noreturn]] void enterDeepSleep() {
+  renderSplash("Sleeping\nHold power to wake", EInkDisplay::FULL_REFRESH);
+  display.deepSleep();
+  freeink::PowerManager::deepSleepUntilPowerButton();
+  for (;;) {
+  }  // unreachable; deepSleepUntilPowerButton never returns
 }
 
 void renderMenu() {
@@ -526,23 +573,43 @@ void setup() {
   g_visible = (g_h - g_theme.headerHeight - g_theme.footerHeight) / kRowHeight;
   if (g_visible < 1) g_visible = 1;
 
+  // Boot splash — the seeding FULL refresh that establishes the panel's
+  // differential base; stays up through SD bring-up. Everything after is a fast
+  // partial refresh, so mark the first paint done and prime the fast pipeline.
+  renderSplash("Booting...", EInkDisplay::FULL_REFRESH);
+  g_firstPaint = false;
+  // X3: prime the fast-refresh pipeline with one fast refresh of the boot frame,
+  // so the first interactive screen is a clean fast refresh rather than the
+  // (slow, full-looking) first differential after the boot full.
+  display.displayBuffer(EInkDisplay::FAST_REFRESH);
+
   if (!SdMan.begin()) {
     g_state = State::Failed;
     g_error = "SD card not detected";
     renderMessage("SD card error", "Insert an SD card with a .bin and reboot.", nullptr);
-    return;
+  } else {
+    g_state = State::Menu;
+    renderMenu();
   }
 
-  g_state = State::Menu;
-  renderMenu();  // boot paint: FULL, seeds the differential base
-
-  // X3: prime the fast-refresh pipeline with one fast refresh of the same frame,
-  // so the first interactive press is a clean fast refresh rather than the
-  // (slow, full-looking) first differential after the boot full.
-  display.displayBuffer(EInkDisplay::FAST_REFRESH);
+  // Power button: drain the wake press so a still-held Power at boot can't
+  // immediately satisfy the sleep-hold threshold, then arm hold-to-sleep after a
+  // brief settle. Works even on the SD-error screen.
+  freeink::PowerManager::waitForPowerButtonRelease();
+  g_allowSleepAt = millis() + 2000;
+  g_powerSleepArmed = true;
 }
 
 void loop() {
+  // Power button: hold for kPowerSleepHoldMs to deep-sleep, from any screen. The
+  // async input task keeps the level/held-time state fresh. Re-arm only once the
+  // button is released so a single long hold can't sleep, wake, and sleep again.
+  if (!input.isPowerButtonPressed()) g_powerSleepArmed = true;
+  if (g_powerSleepArmed && millis() >= g_allowSleepAt && input.isPowerButtonPressed() &&
+      input.getPowerButtonHeldTime() >= kPowerSleepHoldMs) {
+    enterDeepSleep();  // does not return
+  }
+
   // Button test: every press is a reading, not navigation. Show the button's
   // name and the live ADC value of the GPIO its divider drives; a quick second
   // Back press (within the double-tap window) returns to the menu.

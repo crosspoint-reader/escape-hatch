@@ -24,6 +24,11 @@ flash this once and you can always reflash from the SD card with three buttons.
 The button hints along the bottom of every screen are drawn as icons (the
 Lucide-derived set shared with the inkdeck firmware) rather than text labels.
 
+A short **boot splash** seeds the panel on power-up. **Hold the power button**
+(~1.5 s) from any screen to show a **sleep screen** and enter deep sleep; pressing
+the power button again wakes the device (it resets into a fresh boot). The wake
+source is configured per-SoC by the SDK's `PowerManager`.
+
 The flash path is the exact SD-flash process from
 [`crosspoint-reader`](../crosspoint-reader-main) — `FirmwareFlasher` (full ESP32
 image validation: magic, segment table, XOR checksum, SHA-256 trailer; raw
@@ -44,6 +49,8 @@ CrossPoint's `HalStorage` to the FreeInk `SDCardManager` (`FsFile`).
 On the confirm screen, **OK** flashes and reboots; **Back** returns to the list.
 In **Button Test**, every press shows that button's name and ADC reading;
 double-tap **Back** to exit to the menu.
+
+**Hold Power** (~1.5 s) on any screen to deep-sleep; tap **Power** again to wake.
 
 ## Building
 
