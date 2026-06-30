@@ -64,11 +64,12 @@ void pushDisplay() {
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
-enum class State { Menu, Browsing, Confirm, BootConfirm, ButtonTest, EfuseInfo, Failed };
+enum class State { Menu, Browsing, Confirm, BootConfirm, ButtonTest, SdCardTest, EfuseInfo, Failed };
 State g_state = State::Menu;
 
 // Top-level menu entries (home screen).
-const char* kMenuItems[] = {"Flash Firmware", "Button Test", "Boot Other Slot", "EFuse / Security"};
+const char* kMenuItems[] = {"Flash Firmware", "Button Test", "Boot Other Slot", "SD Card Test",
+                            "EFuse / Security"};
 constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
 int g_menuSel = 0;
 
@@ -470,6 +471,80 @@ void renderEfuseInfo() {
   pushDisplay();
 }
 
+// Exercises the SD card end to end: re-mount the card (hardware/SPI access),
+// write a small file, read it back and verify the bytes match, then delete it.
+// Each step is reported with OK/FAIL so a user can see exactly where their card
+// is failing. Stops at the first failure since later steps depend on earlier ones.
+void renderSdCardTest() {
+  const char* kTestPath = "/escape_hatch_sdtest.txt";
+  // Vary the payload per run so a stale leftover file can't masquerade as a pass.
+  const String expected = "escape-hatch SD test " + String(millis());
+
+  std::string body;
+  bool ok = true;
+
+  // 1. Hardware / mount: re-run begin() so this reflects the card that's in the
+  // slot right now, not just the boot-time state.
+  if (SdMan.begin()) {
+    body += "Mount card: OK\n";
+  } else {
+    body += "Mount card: FAIL\n";
+    body += "\nCard not detected. Check it is\ninserted and formatted (FAT32).";
+    ok = false;
+  }
+
+  // 2. Write.
+  if (ok) {
+    if (SdMan.writeFile(kTestPath, expected)) {
+      body += "Write file: OK\n";
+    } else {
+      body += "Write file: FAIL\n";
+      body += "\nCard may be write-protected or full.";
+      ok = false;
+    }
+  }
+
+  // 3. Read back and verify the contents round-tripped.
+  if (ok) {
+    const String got = SdMan.readFile(kTestPath);
+    if (got == expected) {
+      body += "Read back: OK\n";
+    } else if (got.length() == 0) {
+      body += "Read back: FAIL (empty)\n";
+      ok = false;
+    } else {
+      body += "Read back: FAIL (mismatch)\n";
+      ok = false;
+    }
+  }
+
+  // 4. Cleanup: remove the test file (best-effort; report but don't fail the run).
+  if (SdMan.exists(kTestPath)) {
+    body += SdMan.remove(kTestPath) ? "Cleanup: OK\n" : "Cleanup: FAIL\n";
+  }
+
+  body += ok ? "\nSD card is working." : "\nSD card test FAILED.";
+
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("SD Card Test");
+  iconFooter(screen, btnhint::back(), btnhint::none(), btnhint::none(), btnhint::none());
+
+  screen.insetContent(ui::Insets{8, 16, 8, 16});
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Left;
+  ts.maxLines = 12;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
 void renderProgress(const char* title, int pct) {
   display.clearScreen(0xFF);
   ui::DisplayTarget& t = *g_target;
@@ -606,6 +681,9 @@ void doMenu(int navDelta, bool confirm) {
         g_state = State::BootConfirm;
         renderBootConfirm();
       }
+    } else if (g_menuSel == 3) {  // SD Card Test
+      g_state = State::SdCardTest;
+      renderSdCardTest();
     } else {  // EFuse / Security
       g_state = State::EfuseInfo;
       renderEfuseInfo();
@@ -670,6 +748,7 @@ void dispatchAction(int navDelta, bool confirm, bool back) {
       break;
     case State::ButtonTest:
       break;  // handled directly in loop()
+    case State::SdCardTest:
     case State::EfuseInfo:
       if (back || confirm) {
         g_state = State::Menu;
