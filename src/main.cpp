@@ -817,14 +817,13 @@ void setup() {
   // (slow, full-looking) first differential after the boot full.
   display.displayBuffer(EInkDisplay::FAST_REFRESH);
 
-  if (!SdMan.begin()) {
-    g_state = State::Failed;
-    g_error = "SD card not detected";
-    renderMessage("SD card error", "Insert an SD card with a .bin and reboot.", nullptr);
-  } else {
-    g_state = State::Menu;
-    renderMenu();
-  }
+  // Bring up the SD card if present. A missing card isn't fatal — only Flash
+  // Firmware needs it (and it shows "No .bin files" in context), while Button
+  // Test, Boot Other Slot, SD Card Test, and EFuse all work without one — so
+  // boot straight to the menu either way rather than parking on an error screen.
+  SdMan.begin();
+  g_state = State::Menu;
+  renderMenu();
 
   // Power button: drain the wake press so a still-held Power at boot can't
   // immediately satisfy the sleep-hold threshold, then arm hold-to-sleep after a
