@@ -111,6 +111,51 @@ tool writes, and so Escape Hatch can live in one OTA slot while it flashes a ful
 firmware into the other. Escape Hatch is uploaded to **`ota_0`** (`offset_address
 = 0x10000`); a flashed firmware lands in **`ota_1`**.
 
+## Patching an image's version fields
+
+`tools/patch_secure_version.py` rewrites an ESP32 app image's **`secure_version`**
+and/or **app `version` string** in place, then fixes the two integrity fields the
+bootloader checks — the 1-byte image XOR checksum and the appended SHA-256 trailer.
+
+These X3/X4 images are hash-validated only (no Secure Boot *signature*), so there's
+nothing to re-sign: change the field, recompute checksum + hash, and the image is
+valid again. Two uses:
+
+- **Anti-rollback fleets** — a stock build with `CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK`
+  refuses to activate any image whose `secure_version` is below the eFuse minimum
+  (surfaces as an "activate"/error-9 failure). Bump Escape Hatch to that minimum so
+  it flashes *and* boots. Match the minimum **exactly** — a higher value can ratchet
+  the eFuse up on confirm and deepen the wall for everything else.
+- **Version-check flashers** — a stock SD flasher that rejects "downgrades" by
+  comparing the app `version` string. Escape Hatch's default `version` is a git
+  hash (e.g. `8cabf2c`), which such a check reads as older/unparseable; set it to a
+  value that clears the check.
+
+```sh
+# Bump the app version string (defeats a version-downgrade check in a stock flasher)
+python3 tools/patch_secure_version.py .pio/build/default/firmware.bin \
+  --app-version 9.9.9 --out eh_v999.bin
+
+# Set secure_version to satisfy an anti-rollback eFuse minimum (match it exactly)
+python3 tools/patch_secure_version.py .pio/build/default/firmware.bin \
+  --secure-version 5 --out eh_sv5.bin
+
+# Both at once; --out is optional (a name is derived from the fields if omitted)
+python3 tools/patch_secure_version.py .pio/build/default/firmware.bin \
+  --secure-version 5 --app-version 9.9.9
+```
+
+Verify the result — esptool independently re-checks both integrity fields and
+prints the patched values:
+
+```sh
+esptool image-info eh_v999.bin   # expect "Checksum: … (valid)" + "Validation hash: … (valid)"
+```
+
+Once you know which field/value a target fleet needs, the cleanest artifact is a
+real build carrying that version; the patcher is for turning an existing `.bin`
+without a rebuild.
+
 ## Recovery combo (boot back into Escape Hatch)
 
 The SDK lib **`RecoveryBoot`** provides `freeink::recovery::checkBootCombo()`:
