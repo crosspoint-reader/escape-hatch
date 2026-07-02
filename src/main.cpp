@@ -8,6 +8,7 @@
 // crosspoint-reader (FirmwareFlasher + OtaBootSwitch), nothing else.
 
 #include <Arduino.h>
+#include <BatteryMonitor.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
 #include <FreeInkApp.h>
@@ -64,12 +65,22 @@ void pushDisplay() {
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
-enum class State { Menu, Browsing, Confirm, BootConfirm, ButtonTest, SdCardTest, EfuseInfo, Failed };
+enum class State {
+  Menu,
+  Browsing,
+  Confirm,
+  BootConfirm,
+  ButtonTest,
+  SdCardTest,
+  BatteryInfo,
+  EfuseInfo,
+  Failed
+};
 State g_state = State::Menu;
 
 // Top-level menu entries (home screen).
-const char* kMenuItems[] = {"Flash Firmware", "Button Test", "Boot Other Slot", "SD Card Test",
-                            "EFuse / Security"};
+const char* kMenuItems[] = {"Flash Firmware", "Button Test",  "Boot Other Slot",
+                            "SD Card Test",   "Battery Info", "EFuse / Security"};
 constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
 int g_menuSel = 0;
 
@@ -545,6 +556,75 @@ void renderSdCardTest() {
   pushDisplay();
 }
 
+// Live battery telemetry from the SDK's BatteryMonitor. On X4 this is an ADC read
+// of the divided LiPo rail (voltage + a polynomial %); on X3 it's the BQ27220 I2C
+// fuel gauge (true SoC + voltage). Neither X3 nor X4 has a charge-status line wired
+// into their board profile, so `charging` is usually reported as unknown here —
+// the field is shown honestly rather than guessed. Confirm re-reads; Back exits.
+void renderBatteryInfo() {
+  const BatteryMonitor battery;
+  const BatteryMonitor::Status st = battery.readStatus();
+
+  std::string body;
+  if (!st.supported) {
+    body = "No battery telemetry on\nthis board profile.";
+  } else {
+    // Charge %.
+    if (st.percentageKnown) {
+      body += "Charge: " + std::to_string(st.percentage) + "%\n";
+    } else {
+      body += "Charge: unknown\n";
+    }
+
+    // Voltage (mV -> V, two decimals).
+    if (st.millivoltsKnown) {
+      char v[16];
+      snprintf(v, sizeof(v), "%.2f V", st.millivolts / 1000.0);
+      body += "Voltage: " + std::string(v) + " (" + std::to_string(st.millivolts) + " mV)\n";
+    } else {
+      body += "Voltage: unknown\n";
+    }
+
+    // Charging status.
+    if (st.chargingKnown) {
+      body += std::string("Charging: ") + (st.charging ? "YES" : "no") + "\n";
+    } else {
+      body += "Charging: unknown (no charge pin)\n";
+    }
+
+    // External power (M5PM1-class boards; usually unknown on X3/X4).
+    if (st.externalPowerKnown) {
+      body += std::string("External power: ") + (st.externalPower ? "YES" : "no") + "\n";
+    }
+
+    // Raw M5PM1 telemetry, only when actually read (-1 sentinel = not available).
+    if (st.pm1VinMv >= 0) body += "VIN: " + std::to_string(st.pm1VinMv) + " mV\n";
+    if (st.pm1VinOutMv >= 0) body += "5VIN/OUT: " + std::to_string(st.pm1VinOutMv) + " mV\n";
+    if (st.pm1PowerSource >= 0) body += "Power source: " + std::to_string(st.pm1PowerSource) + "\n";
+
+    body += "\nConfirm: re-read";
+  }
+
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("Battery Info");
+  iconFooter(screen, btnhint::back(), btnhint::confirm(), btnhint::none(), btnhint::none());
+
+  screen.insetContent(ui::Insets{8, 16, 8, 16});
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Left;
+  ts.maxLines = 12;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
 void renderProgress(const char* title, int pct) {
   display.clearScreen(0xFF);
   ui::DisplayTarget& t = *g_target;
@@ -684,6 +764,9 @@ void doMenu(int navDelta, bool confirm) {
     } else if (g_menuSel == 3) {  // SD Card Test
       g_state = State::SdCardTest;
       renderSdCardTest();
+    } else if (g_menuSel == 4) {  // Battery Info
+      g_state = State::BatteryInfo;
+      renderBatteryInfo();
     } else {  // EFuse / Security
       g_state = State::EfuseInfo;
       renderEfuseInfo();
@@ -753,6 +836,14 @@ void dispatchAction(int navDelta, bool confirm, bool back) {
       if (back || confirm) {
         g_state = State::Menu;
         renderMenu();
+      }
+      break;
+    case State::BatteryInfo:
+      if (back) {
+        g_state = State::Menu;
+        renderMenu();
+      } else if (confirm) {
+        renderBatteryInfo();  // re-read live telemetry
       }
       break;
     case State::Failed:
