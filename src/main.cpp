@@ -73,16 +73,28 @@ enum class State {
   ButtonTest,
   SdCardTest,
   BatteryInfo,
+  HwDetect,
   EfuseInfo,
   Failed
 };
 State g_state = State::Menu;
 
 // Top-level menu entries (home screen).
-const char* kMenuItems[] = {"Flash Firmware", "Button Test",  "Boot Other Slot",
-                            "SD Card Test",   "Battery Info", "EFuse / Security"};
+const char* kMenuItems[] = {"Flash Firmware", "Button Test",      "Boot Other Slot", "SD Card Test",
+                            "Battery Info",   "Hardware Detect",  "EFuse / Security"};
 constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
 int g_menuSel = 0;
+
+// Boot-time Xteink fingerprint results, captured before display bring-up so the
+// Hardware Detect screen can show them without re-running the panel probe (which
+// pulses the panel's reset line and would leave the live display needing a
+// re-begin()).
+freeink::XteinkVerdict g_xtVerdict = freeink::XteinkVerdict::Inconclusive;
+uint8_t g_xtScore1 = 0, g_xtScore2 = 0;                                          // I2C chip hits per pass (0-3)
+freeink::X3DisplayVerdict g_x3Panel = freeink::X3DisplayVerdict::Uc8253Assumed;  // only meaningful on X3
+uint8_t g_x3Ver[5] = {0};  // raw UC8279 VER (0x70) bytes from the panel probe
+uint8_t g_x3Flg = 0;       // raw UC8279 FLG (0x71) byte
+bool g_x3PanelProbed = false;
 
 // The inactive OTA app partition we're about to switch the bootloader to,
 // captured when the user picks "Boot Other Slot" (only set once validated to
@@ -482,6 +494,58 @@ void renderEfuseInfo() {
   pushDisplay();
 }
 
+// Shows the boot-time Xteink fingerprint: the X3-vs-X4 I2C verdict with its
+// per-pass chip-hit scores, and on an X3 the panel-controller probe (UC8253 vs
+// the newer UC8279 units) with the raw VER/FLG bytes the SDK exposes for
+// bring-up logging. All values were captured in setup() before display init.
+void renderHwDetect() {
+  auto hex2 = [](uint8_t v) {
+    char buf[3];
+    snprintf(buf, sizeof(buf), "%02X", v);
+    return std::string(buf);
+  };
+
+  std::string body = "Profile: " + std::string(BoardConfig::ACTIVE.name) + "\n\n";
+
+  const char* verdict = g_xtVerdict == freeink::XteinkVerdict::X3Confirmed   ? "X3 confirmed"
+                        : g_xtVerdict == freeink::XteinkVerdict::X4Confirmed ? "X4 confirmed"
+                                                                             : "Inconclusive (running as X4)";
+  body += "I2C fingerprint: " + std::string(verdict) + "\n";
+  body += "Chip hits: " + std::to_string(g_xtScore1) + "/3 + " + std::to_string(g_xtScore2) + "/3";
+  body += " (gauge, RTC, IMU)\n\n";
+
+  if (g_x3PanelProbed) {
+    const char* panel = g_x3Panel == freeink::X3DisplayVerdict::Uc8279Confirmed  ? "UC8279 confirmed"
+                        : g_x3Panel == freeink::X3DisplayVerdict::Uc8253Assumed ? "UC8253 (assumed)"
+                                                                                : "Inconclusive (using UC8253)";
+    body += "Panel controller: " + std::string(panel) + "\n";
+    body += "VER:";
+    for (uint8_t b : g_x3Ver) body += " " + hex2(b);
+    body += "\nFLG: " + hex2(g_x3Flg) + "\n";
+  } else {
+    body += "Panel probe: skipped (not an X3)\n";
+  }
+
+  display.clearScreen(0xFF);
+  ui::DeviceContext dev = g_target->deviceContext();
+  ui::InteractionBuffer<4> ib;
+  ui::InputSnapshot empty;
+  ui::Frame<4> frame(*g_target, dev, empty, ib);
+  ui::Screen<4> screen(frame, g_theme);
+
+  screen.header("Hardware Detect");
+  iconFooter(screen, btnhint::back(), btnhint::none(), btnhint::none(), btnhint::none());
+
+  screen.insetContent(ui::Insets{8, 16, 8, 16});
+  ui::TextStyle ts{};
+  ts.align = ui::TextAlign::Left;
+  ts.maxLines = 12;
+  frame.target().text(screen.body(), body.c_str(), ts);
+
+  frame.finish();
+  pushDisplay();
+}
+
 // Exercises the SD card end to end: re-mount the card (hardware/SPI access),
 // write a small file, read it back and verify the bytes match, then delete it.
 // Each step is reported with OK/FAIL so a user can see exactly where their card
@@ -767,6 +831,9 @@ void doMenu(int navDelta, bool confirm) {
     } else if (g_menuSel == 4) {  // Battery Info
       g_state = State::BatteryInfo;
       renderBatteryInfo();
+    } else if (g_menuSel == 5) {  // Hardware Detect
+      g_state = State::HwDetect;
+      renderHwDetect();
     } else {  // EFuse / Security
       g_state = State::EfuseInfo;
       renderEfuseInfo();
@@ -832,6 +899,7 @@ void dispatchAction(int navDelta, bool confirm, bool back) {
     case State::ButtonTest:
       break;  // handled directly in loop()
     case State::SdCardTest:
+    case State::HwDetect:
     case State::EfuseInfo:
       if (back || confirm) {
         g_state = State::Menu;
@@ -866,8 +934,24 @@ void setup() {
   // its keep when the SAME call is the first line of the other firmwares' setup.
   freeink::recovery::checkBootCombo();
 
-  // Pick X3 vs X4 before any peripheral reads the active board profile.
-  const bool isX3 = freeink::selectXteinkDevice();
+  // Pick X3 vs X4 before any peripheral reads the active board profile. This is
+  // selectXteinkDevice() unrolled through the verdict API so the per-pass scores
+  // and raw panel-probe bytes land in globals for the Hardware Detect screen.
+  g_xtVerdict = freeink::detectXteinkVerdict(&g_xtScore1, &g_xtScore2);
+  const bool isX3 = g_xtVerdict == freeink::XteinkVerdict::X3Confirmed;
+  if (isX3) {
+    // X3 confirmed: fingerprint which panel controller this production run
+    // carries and select the matching sibling profile.
+    g_x3Panel = freeink::detectX3DisplayController(g_x3Ver, &g_x3Flg);
+    g_x3PanelProbed = true;
+    BoardConfig::selectDevice(g_x3Panel == freeink::X3DisplayVerdict::Uc8279Confirmed
+                                  ? BoardConfig::Board::XteinkX3Uc8279
+                                  : BoardConfig::Board::XteinkX3);
+  } else {
+    BoardConfig::selectDevice(BoardConfig::Board::XteinkX4);
+  }
+  Serial.printf("[detect] verdict=%d scores=%u/%u panel=%d -> %s\n", static_cast<int>(g_xtVerdict), g_xtScore1,
+                g_xtScore2, static_cast<int>(g_x3Panel), BoardConfig::ACTIVE.name);
 
   // X3/X4 put the SD card on the display's SPI bus (the SD profile leaves
   // sclk/mosi unassigned), so claim the shared bus once, with MISO, before SD
