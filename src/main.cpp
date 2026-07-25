@@ -80,8 +80,8 @@ enum class State {
 State g_state = State::Menu;
 
 // Top-level menu entries (home screen).
-const char* kMenuItems[] = {"Flash Firmware", "Button Test",      "Boot Other Slot", "SD Card Test",
-                            "Battery Info",   "Hardware Detect",  "EFuse / Security"};
+const char* kMenuItems[] = {"Flash Firmware", "Button Test",  "Boot Other Slot",  "SD Card Test",
+                            "Screen Wipe",    "Battery Info", "Hardware Detect",  "EFuse / Security"};
 constexpr int kMenuCount = sizeof(kMenuItems) / sizeof(kMenuItems[0]);
 int g_menuSel = 0;
 
@@ -762,6 +762,31 @@ void goUpDirectory() {
   renderList();
 }
 
+// Ghosting cleanup: alternate all-black / all-white FULL refreshes. A full
+// waveform drives every pixel through its complete transition, and flipping
+// polarity between passes shakes out the residual charge that accumulated
+// partial refreshes leave behind (the ghost outlines of previous screens).
+// Runs synchronously — the flashing panel IS the progress indicator — then
+// re-seeds the UI exactly like boot: one FULL menu paint to establish a clean
+// differential base, plus a FAST pass to prime the X3 fast-refresh pipeline.
+void runScreenWipe() {
+  constexpr int kWipeCycles = 3;
+  for (int i = 0; i < kWipeCycles; ++i) {
+    display.clearScreen(0x00);  // all black
+    display.displayBuffer(EInkDisplay::FULL_REFRESH);
+    display.clearScreen(0xFF);  // all white
+    display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  }
+  g_firstPaint = true;  // next pushDisplay (the menu render) refreshes FULL
+  renderMenu();
+  display.displayBuffer(EInkDisplay::FAST_REFRESH);
+  // Presses latched by the async input task while the wipe blocked the loop
+  // (including the launching Confirm's release ramp) would replay as phantom
+  // menu actions — drop them.
+  uint8_t b;
+  while (input.popPress(b)) {}
+}
+
 // `navDelta` is the net of all queued Up/Down (Left/Right) presses this tick, so
 // rapid scrolling collapses to a single render instead of one per press.
 void doBrowse(int navDelta, bool confirm, bool back) {
@@ -828,10 +853,12 @@ void doMenu(int navDelta, bool confirm) {
     } else if (g_menuSel == 3) {  // SD Card Test
       g_state = State::SdCardTest;
       renderSdCardTest();
-    } else if (g_menuSel == 4) {  // Battery Info
+    } else if (g_menuSel == 4) {  // Screen Wipe — runs in place, stays on the menu
+      runScreenWipe();
+    } else if (g_menuSel == 5) {  // Battery Info
       g_state = State::BatteryInfo;
       renderBatteryInfo();
-    } else if (g_menuSel == 5) {  // Hardware Detect
+    } else if (g_menuSel == 6) {  // Hardware Detect
       g_state = State::HwDetect;
       renderHwDetect();
     } else {  // EFuse / Security
