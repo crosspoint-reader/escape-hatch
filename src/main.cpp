@@ -90,11 +90,10 @@ int g_menuSel = 0;
 // pulses the panel's reset line and would leave the live display needing a
 // re-begin()).
 freeink::XteinkVerdict g_xtVerdict = freeink::XteinkVerdict::Inconclusive;
-uint8_t g_xtScore1 = 0, g_xtScore2 = 0;                                          // I2C chip hits per pass (0-3)
-freeink::X3DisplayVerdict g_x3Panel = freeink::X3DisplayVerdict::Uc8253Assumed;  // only meaningful on X3
-uint8_t g_x3Ver[5] = {0};  // raw UC8279 VER (0x70) bytes from the panel probe
-uint8_t g_x3Flg = 0;       // raw UC8279 FLG (0x71) byte
-bool g_x3PanelProbed = false;
+uint8_t g_xtScore1 = 0, g_xtScore2 = 0;  // I2C chip hits per pass (0-3)
+// Panel-controller probe results live in the SDK's diagnostics snapshot
+// (freeink::getXteinkDisplayProbeDiag()), populated by
+// applyXteinkDisplayController() in setup().
 
 // The inactive OTA app partition we're about to switch the bootloader to,
 // captured when the user picks "Boot Other Slot" (only set once validated to
@@ -495,9 +494,10 @@ void renderEfuseInfo() {
 }
 
 // Shows the boot-time Xteink fingerprint: the X3-vs-X4 I2C verdict with its
-// per-pass chip-hit scores, and on an X3 the panel-controller probe (UC8253 vs
-// the newer UC8279 units) with the raw VER/FLG bytes the SDK exposes for
-// bring-up logging. All values were captured in setup() before display init.
+// per-pass chip-hit scores, and the panel-controller probe (original controller
+// vs the UltraChip sibling newer batches carry) with the raw VER/FLG bytes from
+// the SDK's diagnostics snapshot. All values were captured in setup() before
+// display init.
 void renderHwDetect() {
   auto hex2 = [](uint8_t v) {
     char buf[3];
@@ -514,16 +514,24 @@ void renderHwDetect() {
   body += "Chip hits: " + std::to_string(g_xtScore1) + "/3 + " + std::to_string(g_xtScore2) + "/3";
   body += " (gauge, RTC, IMU)\n\n";
 
-  if (g_x3PanelProbed) {
-    const char* panel = g_x3Panel == freeink::X3DisplayVerdict::Uc8279Confirmed  ? "UC8279 confirmed"
-                        : g_x3Panel == freeink::X3DisplayVerdict::Uc8253Assumed ? "UC8253 (assumed)"
-                                                                                : "Inconclusive (using UC8253)";
-    body += "Panel controller: " + std::string(panel) + "\n";
-    body += "VER:";
-    for (uint8_t b : g_x3Ver) body += " " + hex2(b);
-    body += "\nFLG: " + hex2(g_x3Flg) + "\n";
+  const freeink::XteinkDisplayProbeDiag& diag = freeink::getXteinkDisplayProbeDiag();
+  if (diag.valid) {
+    const auto v = static_cast<freeink::DisplayControllerVerdict>(diag.verdict);
+    const char* panel = v == freeink::DisplayControllerVerdict::Uc81xxConfirmed  ? "UltraChip confirmed"
+                        : v == freeink::DisplayControllerVerdict::PrimaryAssumed ? "Default (assumed)"
+                                                                                 : "Inconclusive (using default)";
+    body += "Panel controller: " + std::string(panel);
+    if (diag.promoted) body += " [driver promoted]";
+    body += "\nVER:";
+    for (uint8_t b : diag.ver) body += " " + hex2(b);
+    body += "\nFLG: " + hex2(diag.flg) + "\n";
+    if (diag.mtpValid) {
+      body += "MTP:";
+      for (size_t i = 0; i < 8; i++) body += " " + hex2(diag.mtp[i]);
+      body += " ...\n";
+    }
   } else {
-    body += "Panel probe: skipped (not an X3)\n";
+    body += "Panel probe: not run\n";
   }
 
   display.clearScreen(0xFF);
@@ -963,22 +971,23 @@ void setup() {
 
   // Pick X3 vs X4 before any peripheral reads the active board profile. This is
   // selectXteinkDevice() unrolled through the verdict API so the per-pass scores
-  // and raw panel-probe bytes land in globals for the Hardware Detect screen.
+  // land in globals for the Hardware Detect screen.
   g_xtVerdict = freeink::detectXteinkVerdict(&g_xtScore1, &g_xtScore2);
   const bool isX3 = g_xtVerdict == freeink::XteinkVerdict::X3Confirmed;
-  if (isX3) {
-    // X3 confirmed: fingerprint which panel controller this production run
-    // carries and select the matching sibling profile.
-    g_x3Panel = freeink::detectX3DisplayController(g_x3Ver, &g_x3Flg);
-    g_x3PanelProbed = true;
-    BoardConfig::selectDevice(g_x3Panel == freeink::X3DisplayVerdict::Uc8279Confirmed
-                                  ? BoardConfig::Board::XteinkX3Uc8279
-                                  : BoardConfig::Board::XteinkX3);
-  } else {
-    BoardConfig::selectDevice(BoardConfig::Board::XteinkX4);
-  }
-  Serial.printf("[detect] verdict=%d scores=%u/%u panel=%d -> %s\n", static_cast<int>(g_xtVerdict), g_xtScore1,
-                g_xtScore2, static_cast<int>(g_x3Panel), BoardConfig::ACTIVE.name);
+  BoardConfig::selectDevice(isX3 ? BoardConfig::Board::XteinkX3 : BoardConfig::Board::XteinkX4);
+  // Panel selection must precede the controller probe: setDisplayX3() re-selects
+  // the X3 profile (a full ACTIVE overwrite), which would wipe a promoted
+  // controller if it ran after.
+  if (isX3) display.setDisplayX3();
+  // Fingerprint the panel controller on the live display bus and promote
+  // ACTIVE.displayController to the UltraChip sibling this unit actually
+  // carries (X3: UC8253 -> UC8279d; X4: SSD1677 -> UC8179/UC8279), so
+  // display.begin() selects the matching driver. Results land in the SDK's
+  // diagnostics snapshot for the Hardware Detect screen.
+  const bool promoted = freeink::applyXteinkDisplayController();
+  Serial.printf("[detect] verdict=%d scores=%u/%u promoted=%d -> %s (controller=%d)\n", static_cast<int>(g_xtVerdict),
+                g_xtScore1, g_xtScore2, promoted, BoardConfig::ACTIVE.name,
+                static_cast<int>(BoardConfig::ACTIVE.displayController));
 
   // X3/X4 put the SD card on the display's SPI bus (the SD profile leaves
   // sclk/mosi unassigned), so claim the shared bus once, with MISO, before SD
@@ -986,7 +995,6 @@ void setup() {
   SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
             BoardConfig::ACTIVE.display.cs);
 
-  if (isX3) display.setDisplayX3();
   display.begin();
   delay(50);  // let the panel finish powering up so the boot paint isn't dropped
   input.begin();
