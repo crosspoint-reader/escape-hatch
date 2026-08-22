@@ -758,7 +758,15 @@ void doFlash() {
     return;  // not reached
   }
 
-  g_error = std::string("Flash failed: ") + firmware_flash::resultName(res);
+  // The two wrong-device rejections deserve plain language — they are the
+  // user picking the wrong file, not a broken card or corrupt download.
+  if (res == firmware_flash::Result::BAD_CHIP) {
+    g_error = "This image is built for a different chip family and would brick this device.";
+  } else if (res == firmware_flash::Result::WRONG_BOARD) {
+    g_error = "This image is tagged for a different board, not this device.";
+  } else {
+    g_error = std::string("Flash failed: ") + firmware_flash::resultName(res);
+  }
   g_state = State::Failed;
   renderMessage("Update failed", g_error.c_str(), "Any key: back");
 }
