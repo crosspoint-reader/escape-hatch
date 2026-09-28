@@ -1,4 +1,4 @@
-// Escape Hatch — the most minimal X3/X4/X4-Pro firmware that can reflash the
+// Escape Hatch — the most minimal X3/X4/X4-Pro/X4C firmware that can reflash the
 // device.
 //
 // Boots, detects the device variant, mounts the SD card, and shows a file
@@ -1028,6 +1028,13 @@ void handleUiAction(const ui::ActionEvent& ev) {
 // Lifecycle
 // ---------------------------------------------------------------------------
 void setup() {
+  // Assert the board's power-rail latches first, like crosspoint-reader. On the
+  // S3 boards this is GPIO1, the master peripheral rail: without it the X4 Pro's
+  // GT911 stays unpowered on battery (touch only worked when USB back-fed the
+  // rail). The C3 build got this implicitly via selectDevice(); single-profile
+  // S3 builds never call that.
+  BoardConfig::holdPowerRails();
+
   Serial.begin(115200);
   delay(50);
 

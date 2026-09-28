@@ -78,6 +78,8 @@ Then:
 ```sh
 pio run                 # build (env: default, X3+X4 dual binary)
 pio run -t upload       # flash over USB
+pio run -e x4pro        # ESP32-S3 X4 Pro (touch)
+pio run -e x4c          # ESP32-S3 X4 Classic (buttons only)
 pio device monitor      # 115200 baud logs
 ```
 
